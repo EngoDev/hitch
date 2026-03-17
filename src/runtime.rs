@@ -1,12 +1,13 @@
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
-use crate::config::Config;
+use crate::config::{Config, Mode};
 use crate::detect::{DetectionEvent, UrlDetector};
 use crate::origin::resolve_origin;
 use crate::status;
@@ -22,6 +23,12 @@ pub struct ScriptedSession {
 pub struct RunOutcome {
     pub exit_code: i32,
     pub mirrored_output: String,
+    pub messages: Vec<String>,
+}
+
+#[cfg(test)]
+pub struct PortModeOutcome {
+    pub exit_code: i32,
     pub messages: Vec<String>,
 }
 
@@ -65,6 +72,98 @@ impl<L: TunnelLauncher> TunnelLauncher for PausingTunnelLauncher<L> {
         result
     }
 }
+
+trait TerminalModeManager {
+    type Guard;
+
+    fn enter_raw_mode(&self) -> io::Result<Self::Guard>;
+}
+
+fn with_terminal_mode<M, F, T>(manager: &M, operation: F) -> io::Result<T>
+where
+    M: TerminalModeManager,
+    F: FnOnce() -> io::Result<T>,
+{
+    let _guard = manager.enter_raw_mode()?;
+    operation()
+}
+
+#[cfg(not(unix))]
+struct NoopTerminalModeManager;
+
+#[cfg(not(unix))]
+impl TerminalModeManager for NoopTerminalModeManager {
+    type Guard = ();
+
+    fn enter_raw_mode(&self) -> io::Result<Self::Guard> {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+struct StdinRawModeManager;
+
+#[cfg(unix)]
+struct StdinRawModeGuard {
+    fd: libc::c_int,
+    original: libc::termios,
+    active: bool,
+}
+
+#[cfg(unix)]
+impl Drop for StdinRawModeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
+        }
+    }
+}
+
+#[cfg(unix)]
+impl TerminalModeManager for StdinRawModeManager {
+    type Guard = StdinRawModeGuard;
+
+    fn enter_raw_mode(&self) -> io::Result<Self::Guard> {
+        use std::mem;
+        use std::os::fd::AsRawFd;
+
+        let fd = io::stdin().as_raw_fd();
+        if unsafe { libc::isatty(fd) } != 1 {
+            return Ok(StdinRawModeGuard {
+                fd,
+                original: unsafe { mem::zeroed() },
+                active: false,
+            });
+        }
+
+        let mut original = unsafe { mem::zeroed::<libc::termios>() };
+        if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let raw = build_raw_terminal_mode(&original);
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(StdinRawModeGuard {
+            fd,
+            original,
+            active: true,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn build_raw_terminal_mode(original: &libc::termios) -> libc::termios {
+    let mut raw = *original;
+    unsafe { libc::cfmakeraw(&mut raw) };
+    raw.c_oflag = original.c_oflag;
+    raw
+}
+
+#[cfg(not(unix))]
+type StdinRawModeManager = NoopTerminalModeManager;
 
 pub struct Runtime<L: TunnelLauncher> {
     detector: UrlDetector,
@@ -169,57 +268,174 @@ impl<L: TunnelLauncher> Runtime<L> {
             messages: runtime.drain_messages(),
         }
     }
+
+    #[cfg(test)]
+    pub fn run_port_mode_for_test(
+        launcher: L,
+        origin: Option<String>,
+        user: Option<String>,
+        port: u16,
+        interrupted: bool,
+    ) -> PortModeOutcome {
+        let exit_code =
+            run_port_mode_with_wait(launcher, origin.clone(), user, port, || match interrupted {
+                true => Ok(()),
+                false => Err(io::Error::other("interrupt was not delivered")),
+            })
+            .unwrap();
+
+        let messages = match (origin.is_some(), interrupted) {
+            (false, _) => vec![status::missing_origin()],
+            (true, true) => vec![status::opening_direct_tunnel(port)],
+            (true, false) => Vec::new(),
+        };
+
+        PortModeOutcome {
+            exit_code,
+            messages,
+        }
+    }
 }
 
 pub fn run_wrapped_command(config: Config) -> Result<i32, Box<dyn std::error::Error>> {
+    match config.mode {
+        Mode::Command { command } => run_command_mode(config.origin, config.user, command),
+        Mode::Port { port } => run_port_mode(config.origin, config.user, port),
+    }
+}
+
+fn run_command_mode(
+    origin_override: Option<String>,
+    user: Option<String>,
+    wrapped_command: Vec<String>,
+) -> Result<i32, Box<dyn std::error::Error>> {
     let origin = resolve_origin(
-        config.origin.as_deref(),
+        origin_override.as_deref(),
+        std::env::var("SSH_CONNECTION").ok().as_deref(),
+    )
+    .ok();
+    with_terminal_mode(&StdinRawModeManager, || {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize::default())
+            .map_err(|error| io::Error::other(error.to_string()))?;
+
+        let mut command = CommandBuilder::new(&wrapped_command[0]);
+        if wrapped_command.len() > 1 {
+            command.args(&wrapped_command[1..]);
+        }
+
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        drop(pair.slave);
+
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let input_gate = InputGate::default();
+
+        let runtime = Arc::new(Mutex::new(Runtime::new(
+            PausingTunnelLauncher::new(SshTunnelLauncher, input_gate.clone()),
+            origin,
+            user,
+        )));
+
+        let output_runtime = Arc::clone(&runtime);
+        let output_thread = thread::spawn(move || mirror_output(reader, output_runtime));
+        let _input_thread = thread::spawn(move || forward_input(writer, input_gate));
+
+        let exit_status = child.wait()?;
+        let output_result = output_thread
+            .join()
+            .map_err(|_| io::Error::other("output thread panicked"))?;
+        output_result?;
+
+        let trailing_messages = {
+            let mut runtime = runtime
+                .lock()
+                .map_err(|_| io::Error::other("runtime mutex poisoned"))?;
+            runtime.finish()?;
+            runtime.drain_messages()
+        };
+
+        print_status_messages(trailing_messages)?;
+
+        Ok(exit_status.exit_code() as i32)
+    })
+    .map_err(Into::into)
+}
+
+fn run_port_mode(
+    origin_override: Option<String>,
+    user: Option<String>,
+    port: u16,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let origin = resolve_origin(
+        origin_override.as_deref(),
         std::env::var("SSH_CONNECTION").ok().as_deref(),
     )
     .ok();
 
-    let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize::default())?;
-
-    let mut command = CommandBuilder::new(&config.command[0]);
-    if config.command.len() > 1 {
-        command.args(&config.command[1..]);
-    }
-
-    let mut child = pair.slave.spawn_command(command)?;
-    drop(pair.slave);
-
-    let reader = pair.master.try_clone_reader()?;
-    let writer = pair.master.take_writer()?;
-    let input_gate = InputGate::default();
-
-    let runtime = Arc::new(Mutex::new(Runtime::new(
-        PausingTunnelLauncher::new(SshTunnelLauncher, input_gate.clone()),
+    run_port_mode_with_wait(
+        PausingTunnelLauncher::new(SshTunnelLauncher, InputGate::default()),
         origin,
-        config.user,
-    )));
+        user,
+        port,
+        wait_for_ctrl_c,
+    )
+}
 
-    let output_runtime = Arc::clone(&runtime);
-    let output_thread = thread::spawn(move || mirror_output(reader, output_runtime));
-    let _input_thread = thread::spawn(move || forward_input(writer, input_gate));
-
-    let exit_status = child.wait()?;
-    let output_result = output_thread
-        .join()
-        .map_err(|_| io::Error::other("output thread panicked"))?;
-    output_result?;
-
-    let trailing_messages = {
-        let mut runtime = runtime
-            .lock()
-            .map_err(|_| io::Error::other("runtime mutex poisoned"))?;
-        runtime.finish()?;
-        runtime.drain_messages()
+fn run_port_mode_with_wait<L, F>(
+    mut launcher: L,
+    origin: Option<String>,
+    user: Option<String>,
+    port: u16,
+    wait_for_interrupt: F,
+) -> Result<i32, Box<dyn std::error::Error>>
+where
+    L: TunnelLauncher,
+    F: FnOnce() -> io::Result<()>,
+{
+    let Some(origin) = origin.as_deref() else {
+        print_status_messages(vec![status::missing_origin()])?;
+        return Ok(1);
     };
 
-    print_status_messages(trailing_messages)?;
+    let destination = format_destination(origin, user.as_deref());
+    print_status_messages(vec![status::opening_direct_tunnel(port)])?;
 
-    Ok(exit_status.exit_code() as i32)
+    let mut handle = match launcher.launch(&destination, port) {
+        Ok(handle) => handle,
+        Err(error) => {
+            print_status_messages(vec![status::tunnel_launch_failed(&error)])?;
+            return Ok(1);
+        }
+    };
+
+    print_status_messages(vec![status::starting_tunnel(&destination, port)])?;
+    wait_for_interrupt()?;
+    handle.stop()?;
+    Ok(0)
+}
+
+fn wait_for_ctrl_c() -> io::Result<()> {
+    let (sender, receiver) = mpsc::channel();
+    ctrlc::set_handler(move || {
+        let _ = sender.send(());
+    })
+    .map_err(|error| io::Error::other(error.to_string()))?;
+
+    receiver
+        .recv()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(())
 }
 
 fn mirror_output<L: TunnelLauncher + Send + 'static>(
@@ -339,7 +555,12 @@ mod tests {
     use std::io;
     use std::rc::Rc;
 
-    use super::{InputGate, PausingTunnelLauncher, Runtime, ScriptedSession};
+    #[cfg(unix)]
+    use super::build_raw_terminal_mode;
+    use super::{
+        InputGate, PausingTunnelLauncher, Runtime, ScriptedSession, TerminalModeManager,
+        with_terminal_mode,
+    };
     use crate::tunnel::{TunnelHandle, TunnelLauncher};
 
     #[derive(Debug, Default, Clone)]
@@ -421,6 +642,38 @@ mod tests {
             *self.saw_paused_gate.borrow_mut() = self.gate.is_paused();
             Ok(FakeTunnelHandle {
                 state: Rc::new(RefCell::new(LauncherState::default())),
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeTerminalModeManager {
+        state: Rc<RefCell<TerminalModeState>>,
+    }
+
+    #[derive(Default)]
+    struct TerminalModeState {
+        enter_count: usize,
+        drop_count: usize,
+    }
+
+    struct FakeTerminalModeGuard {
+        state: Rc<RefCell<TerminalModeState>>,
+    }
+
+    impl Drop for FakeTerminalModeGuard {
+        fn drop(&mut self) {
+            self.state.borrow_mut().drop_count += 1;
+        }
+    }
+
+    impl TerminalModeManager for FakeTerminalModeManager {
+        type Guard = FakeTerminalModeGuard;
+
+        fn enter_raw_mode(&self) -> io::Result<Self::Guard> {
+            self.state.borrow_mut().enter_count += 1;
+            Ok(FakeTerminalModeGuard {
+                state: Rc::clone(&self.state),
             })
         }
     }
@@ -573,5 +826,92 @@ mod tests {
 
         assert!(*saw_paused_gate.borrow());
         assert!(!gate.is_paused());
+    }
+
+    #[test]
+    fn terminal_mode_is_restored_after_successful_operation() {
+        let manager = FakeTerminalModeManager::default();
+        let state = Rc::clone(&manager.state);
+
+        let result = with_terminal_mode(&manager, || Ok::<_, io::Error>(42)).unwrap();
+
+        assert_eq!(result, 42);
+        assert_eq!(state.borrow().enter_count, 1);
+        assert_eq!(state.borrow().drop_count, 1);
+    }
+
+    #[test]
+    fn terminal_mode_is_restored_after_failed_operation() {
+        let manager = FakeTerminalModeManager::default();
+        let state = Rc::clone(&manager.state);
+
+        let error =
+            with_terminal_mode(&manager, || Err::<(), _>(io::Error::other("boom"))).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(state.borrow().enter_count, 1);
+        assert_eq!(state.borrow().drop_count, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_terminal_mode_preserves_output_flags() {
+        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+        original.c_oflag = 0o12345;
+
+        let raw = build_raw_terminal_mode(&original);
+
+        assert_eq!(raw.c_oflag, original.c_oflag);
+    }
+
+    #[test]
+    fn port_mode_starts_one_tunnel_for_requested_port() {
+        let launcher = FakeTunnelLauncher::new();
+        let outcome = Runtime::run_port_mode_for_test(
+            launcher.clone(),
+            Some("203.0.113.10".to_string()),
+            Some("alice".to_string()),
+            38983,
+            true,
+        );
+
+        assert_eq!(launcher.started_ports(), vec![38983]);
+        assert_eq!(launcher.stop_count(), 1);
+        assert_eq!(outcome.exit_code, 0);
+        assert!(
+            outcome
+                .messages
+                .iter()
+                .any(|message| message.contains("38983"))
+        );
+    }
+
+    #[test]
+    fn port_mode_fails_when_origin_is_missing() {
+        let launcher = FakeTunnelLauncher::new();
+        let outcome = Runtime::run_port_mode_for_test(launcher.clone(), None, None, 38983, true);
+
+        assert!(launcher.started_ports().is_empty());
+        assert_ne!(outcome.exit_code, 0);
+        assert!(
+            outcome
+                .messages
+                .iter()
+                .any(|message| message.contains("could not determine tunnel origin"))
+        );
+    }
+
+    #[test]
+    fn port_mode_stops_tunnel_on_interrupt() {
+        let launcher = FakeTunnelLauncher::new();
+        let _outcome = Runtime::run_port_mode_for_test(
+            launcher.clone(),
+            Some("203.0.113.10".to_string()),
+            None,
+            38983,
+            true,
+        );
+
+        assert_eq!(launcher.stop_count(), 1);
     }
 }

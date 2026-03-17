@@ -6,6 +6,10 @@ pub fn starting_tunnel(destination: &str, port: u16) -> String {
     format!("Starting reverse tunnel for port {port} to {destination}")
 }
 
+pub fn opening_direct_tunnel(port: u16) -> String {
+    format!("Opening reverse tunnel for requested port {port}")
+}
+
 pub fn non_loopback_redirect(url: &str, host: &str) -> String {
     format!(
         "Found redirect URL {url} with host {host}, but it does not lead to localhost. Check the original login command configuration."
