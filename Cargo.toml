@@ -1,5 +1,5 @@
 [package]
-name = "hatchway"
+name = "hitch"
 version = "0.1.0"
 edition = "2024"
 authors = ["EngoDev"]
@@ -8,3 +8,8 @@ readme = "README.md"
 description = "CLI tool for easily logging into accounts using aouth2 from a remote machine."
 
 [dependencies]
+clap = { version = "4.5.39", features = ["derive"] }
+libc = "0.2.183"
+portable-pty = "0.9.0"
+regex = "1.12.2"
+url = "2.5.7"
