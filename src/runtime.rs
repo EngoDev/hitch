@@ -8,6 +8,9 @@ use std::time::Duration;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use crate::config::{Config, Mode};
+use crate::confirm::{
+    InquireTunnelConfigEditor, TunnelConfig, TunnelConfigEditor, confirm_tunnel_config,
+};
 use crate::detect::{DetectionEvent, UrlDetector};
 use crate::origin::resolve_origin;
 use crate::status;
@@ -59,6 +62,45 @@ pub struct PausingTunnelLauncher<L> {
 impl<L> PausingTunnelLauncher<L> {
     pub fn new(inner: L, input_gate: InputGate) -> Self {
         Self { inner, input_gate }
+    }
+}
+
+struct PausingTunnelConfigEditor<E> {
+    inner: E,
+    input_gate: InputGate,
+}
+
+impl<E> PausingTunnelConfigEditor<E> {
+    fn new(inner: E, input_gate: InputGate) -> Self {
+        Self { inner, input_gate }
+    }
+
+    fn with_paused_input<F, T>(&mut self, operation: F) -> io::Result<T>
+    where
+        F: FnOnce(&mut E) -> io::Result<T>,
+    {
+        self.input_gate.pause();
+        let result = operation(&mut self.inner);
+        self.input_gate.resume();
+        result
+    }
+}
+
+impl<E: TunnelConfigEditor> TunnelConfigEditor for PausingTunnelConfigEditor<E> {
+    fn confirm_detected_config(&mut self, config: &TunnelConfig) -> io::Result<bool> {
+        self.with_paused_input(|inner| inner.confirm_detected_config(config))
+    }
+
+    fn edit_port(&mut self, current: u16) -> io::Result<String> {
+        self.with_paused_input(|inner| inner.edit_port(current))
+    }
+
+    fn edit_user(&mut self, current: Option<&str>) -> io::Result<String> {
+        self.with_paused_input(|inner| inner.edit_user(current))
+    }
+
+    fn edit_origin(&mut self, current: &str) -> io::Result<String> {
+        self.with_paused_input(|inner| inner.edit_origin(current))
     }
 }
 
@@ -168,6 +210,7 @@ type StdinRawModeManager = NoopTerminalModeManager;
 pub struct Runtime<L: TunnelLauncher> {
     detector: UrlDetector,
     launcher: L,
+    editor: Box<dyn TunnelConfigEditor>,
     origin: Option<String>,
     user: Option<String>,
     messages: Vec<String>,
@@ -176,10 +219,16 @@ pub struct Runtime<L: TunnelLauncher> {
 }
 
 impl<L: TunnelLauncher> Runtime<L> {
-    pub fn new(launcher: L, origin: Option<String>, user: Option<String>) -> Self {
+    pub fn new(
+        launcher: L,
+        editor: Box<dyn TunnelConfigEditor>,
+        origin: Option<String>,
+        user: Option<String>,
+    ) -> Self {
         Self {
             detector: UrlDetector::default(),
             launcher,
+            editor,
             origin,
             user,
             messages: Vec::new(),
@@ -190,11 +239,7 @@ impl<L: TunnelLauncher> Runtime<L> {
 
     pub fn on_output(&mut self, text: &str) {
         match self.detector.consume(text) {
-            Some(DetectionEvent::StartTunnel { host, port, url }) => {
-                self.messages
-                    .push(status::found_loopback_url(&url, &host, port));
-                self.try_start_tunnel(port);
-            }
+            Some(DetectionEvent::StartTunnel { port, .. }) => self.try_start_tunnel(port),
             Some(DetectionEvent::WarnNonLoopback { host, url }) => {
                 self.messages
                     .push(status::non_loopback_redirect(&url, &host));
@@ -233,12 +278,25 @@ impl<L: TunnelLauncher> Runtime<L> {
             return;
         };
 
-        let destination = format_destination(origin, self.user.as_deref());
+        let config = TunnelConfig {
+            port,
+            user: self.user.clone(),
+            origin: origin.to_string(),
+        };
+        let config = match confirm_tunnel_config(self.editor.as_mut(), config) {
+            Ok(config) => config,
+            Err(error) => {
+                self.messages
+                    .push(status::tunnel_confirmation_failed(&error));
+                return;
+            }
+        };
+        let destination = format_destination(&config.origin, config.user.as_deref());
 
-        match self.launcher.launch(&destination, port) {
+        match self.launcher.launch(&destination, config.port) {
             Ok(handle) => {
                 self.messages
-                    .push(status::starting_tunnel(&destination, port));
+                    .push(status::starting_tunnel(&destination, config.port));
                 self.tunnel_handle = Some(handle);
             }
             Err(error) => self.messages.push(status::tunnel_launch_failed(&error)),
@@ -248,11 +306,12 @@ impl<L: TunnelLauncher> Runtime<L> {
     #[cfg(test)]
     pub fn run_scripted_for_test(
         launcher: L,
+        editor: Box<dyn TunnelConfigEditor>,
         origin: Option<String>,
         user: Option<String>,
         session: ScriptedSession,
     ) -> RunOutcome {
-        let mut runtime = Runtime::new(launcher, origin, user);
+        let mut runtime = Runtime::new(launcher, editor, origin, user);
         let mut mirrored_output = String::new();
 
         for chunk in session.output_chunks {
@@ -343,6 +402,10 @@ fn run_command_mode(
 
         let runtime = Arc::new(Mutex::new(Runtime::new(
             PausingTunnelLauncher::new(SshTunnelLauncher, input_gate.clone()),
+            Box::new(PausingTunnelConfigEditor::new(
+                InquireTunnelConfigEditor,
+                input_gate.clone(),
+            )),
             origin,
             user,
         )));
@@ -554,13 +617,15 @@ mod tests {
     use std::cell::RefCell;
     use std::io;
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     #[cfg(unix)]
     use super::build_raw_terminal_mode;
     use super::{
-        InputGate, PausingTunnelLauncher, Runtime, ScriptedSession, TerminalModeManager,
-        with_terminal_mode,
+        InputGate, PausingTunnelConfigEditor, PausingTunnelLauncher, Runtime, ScriptedSession,
+        TerminalModeManager, with_terminal_mode,
     };
+    use crate::confirm::{TunnelConfig, TunnelConfigEditor};
     use crate::tunnel::{TunnelHandle, TunnelLauncher};
 
     #[derive(Debug, Default, Clone)]
@@ -598,6 +663,10 @@ mod tests {
         fn stop_count(&self) -> usize {
             self.state.borrow().stop_count
         }
+
+        fn destinations(&self) -> Vec<String> {
+            self.state.borrow().destinations.clone()
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -629,6 +698,48 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct AcceptingEditor;
+
+    impl TunnelConfigEditor for AcceptingEditor {
+        fn confirm_detected_config(&mut self, _config: &TunnelConfig) -> io::Result<bool> {
+            Ok(true)
+        }
+
+        fn edit_port(&mut self, _current: u16) -> io::Result<String> {
+            panic!("unexpected port edit")
+        }
+
+        fn edit_user(&mut self, _current: Option<&str>) -> io::Result<String> {
+            panic!("unexpected user edit")
+        }
+
+        fn edit_origin(&mut self, _current: &str) -> io::Result<String> {
+            panic!("unexpected origin edit")
+        }
+    }
+
+    #[derive(Default)]
+    struct EditingEditor;
+
+    impl TunnelConfigEditor for EditingEditor {
+        fn confirm_detected_config(&mut self, _config: &TunnelConfig) -> io::Result<bool> {
+            Ok(false)
+        }
+
+        fn edit_port(&mut self, _current: u16) -> io::Result<String> {
+            Ok("4000".into())
+        }
+
+        fn edit_user(&mut self, _current: Option<&str>) -> io::Result<String> {
+            Ok(String::new())
+        }
+
+        fn edit_origin(&mut self, _current: &str) -> io::Result<String> {
+            Ok("203.0.113.10".into())
+        }
+    }
+
     #[derive(Clone)]
     struct GateAwareLauncher {
         gate: InputGate,
@@ -643,6 +754,30 @@ mod tests {
             Ok(FakeTunnelHandle {
                 state: Rc::new(RefCell::new(LauncherState::default())),
             })
+        }
+    }
+
+    struct GateAwareEditor {
+        gate: InputGate,
+        saw_paused_gate: Arc<Mutex<bool>>,
+    }
+
+    impl TunnelConfigEditor for GateAwareEditor {
+        fn confirm_detected_config(&mut self, _config: &TunnelConfig) -> io::Result<bool> {
+            *self.saw_paused_gate.lock().unwrap() = self.gate.is_paused();
+            Ok(true)
+        }
+
+        fn edit_port(&mut self, _current: u16) -> io::Result<String> {
+            panic!("unexpected port edit")
+        }
+
+        fn edit_user(&mut self, _current: Option<&str>) -> io::Result<String> {
+            panic!("unexpected user edit")
+        }
+
+        fn edit_origin(&mut self, _current: &str) -> io::Result<String> {
+            panic!("unexpected origin edit")
         }
     }
 
@@ -681,7 +816,12 @@ mod tests {
     #[test]
     fn starts_tunnel_once_for_first_valid_loopback_url() {
         let launcher = FakeTunnelLauncher::new();
-        let mut runtime = Runtime::new(launcher.clone(), Some("203.0.113.10".to_string()), None);
+        let mut runtime = Runtime::new(
+            launcher.clone(),
+            Box::new(AcceptingEditor),
+            Some("203.0.113.10".to_string()),
+            None,
+        );
 
         runtime.on_output("login at http://localhost:8080/callback");
         runtime.on_output("again at http://localhost:9090/callback");
@@ -698,7 +838,7 @@ mod tests {
     #[test]
     fn reports_missing_origin_without_starting_tunnel() {
         let launcher = FakeTunnelLauncher::new();
-        let mut runtime = Runtime::new(launcher.clone(), None, None);
+        let mut runtime = Runtime::new(launcher.clone(), Box::new(AcceptingEditor), None, None);
 
         runtime.on_output("login at http://localhost:8080/callback");
 
@@ -714,7 +854,12 @@ mod tests {
     #[test]
     fn warns_for_non_loopback_redirects() {
         let launcher = FakeTunnelLauncher::new();
-        let mut runtime = Runtime::new(launcher.clone(), Some("203.0.113.10".to_string()), None);
+        let mut runtime = Runtime::new(
+            launcher.clone(),
+            Box::new(AcceptingEditor),
+            Some("203.0.113.10".to_string()),
+            None,
+        );
 
         runtime.on_output("login at https://example.com/callback");
 
@@ -730,7 +875,12 @@ mod tests {
     #[test]
     fn reports_tunnel_launch_failures_and_keeps_running() {
         let launcher = FakeTunnelLauncher::failing();
-        let mut runtime = Runtime::new(launcher, Some("203.0.113.10".to_string()), None);
+        let mut runtime = Runtime::new(
+            launcher,
+            Box::new(AcceptingEditor),
+            Some("203.0.113.10".to_string()),
+            None,
+        );
 
         runtime.on_output("login at http://localhost:8080/callback");
 
@@ -747,6 +897,7 @@ mod tests {
         let launcher = FakeTunnelLauncher::new();
         let outcome = Runtime::run_scripted_for_test(
             launcher.clone(),
+            Box::new(AcceptingEditor),
             Some("203.0.113.10".to_string()),
             None,
             ScriptedSession {
@@ -771,6 +922,7 @@ mod tests {
         let launcher = FakeTunnelLauncher::new();
         let _outcome = Runtime::run_scripted_for_test(
             launcher.clone(),
+            Box::new(AcceptingEditor),
             Some("203.0.113.10".to_string()),
             None,
             ScriptedSession {
@@ -787,6 +939,7 @@ mod tests {
         let launcher = FakeTunnelLauncher::failing();
         let outcome = Runtime::run_scripted_for_test(
             launcher,
+            Box::new(AcceptingEditor),
             Some("203.0.113.10".to_string()),
             None,
             ScriptedSession {
@@ -825,6 +978,31 @@ mod tests {
         let _handle = launcher.launch("203.0.113.10", 38983).unwrap();
 
         assert!(*saw_paused_gate.borrow());
+        assert!(!gate.is_paused());
+    }
+
+    #[test]
+    fn pausing_tunnel_editor_pauses_input_during_confirmation_and_resumes_after() {
+        let gate = InputGate::default();
+        let saw_paused_gate = Arc::new(Mutex::new(false));
+        let mut editor = PausingTunnelConfigEditor::new(
+            GateAwareEditor {
+                gate: gate.clone(),
+                saw_paused_gate: Arc::clone(&saw_paused_gate),
+            },
+            gate.clone(),
+        );
+
+        let accepted = editor
+            .confirm_detected_config(&TunnelConfig {
+                port: 3001,
+                user: Some("engodev".into()),
+                origin: "100.70.126.5".into(),
+            })
+            .unwrap();
+
+        assert!(accepted);
+        assert!(*saw_paused_gate.lock().unwrap());
         assert!(!gate.is_paused());
     }
 
@@ -913,5 +1091,40 @@ mod tests {
         );
 
         assert_eq!(launcher.stop_count(), 1);
+    }
+
+    #[test]
+    fn detected_tunnel_uses_confirmed_values_without_edits() {
+        let launcher = FakeTunnelLauncher::new();
+        let mut runtime = Runtime::new(
+            launcher.clone(),
+            Box::new(AcceptingEditor),
+            Some("100.70.126.5".to_string()),
+            Some("engodev".to_string()),
+        );
+
+        runtime.on_output("Waiting for callback on http://localhost:3001/auth/callback");
+
+        assert_eq!(launcher.started_ports(), vec![3001]);
+        assert_eq!(
+            launcher.destinations(),
+            vec!["engodev@100.70.126.5".to_string()]
+        );
+    }
+
+    #[test]
+    fn detected_tunnel_uses_edited_values_before_launch() {
+        let launcher = FakeTunnelLauncher::new();
+        let mut runtime = Runtime::new(
+            launcher.clone(),
+            Box::new(EditingEditor),
+            Some("100.70.126.5".to_string()),
+            Some("engodev".to_string()),
+        );
+
+        runtime.on_output("Waiting for callback on http://localhost:3001/auth/callback");
+
+        assert_eq!(launcher.started_ports(), vec![4000]);
+        assert_eq!(launcher.destinations(), vec!["203.0.113.10".to_string()]);
     }
 }

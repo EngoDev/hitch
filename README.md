@@ -15,7 +15,8 @@ When the wrapped command prints a loopback redirect URL such as `http://localhos
 1. keeps the wrapped command interactive by running it in a PTY,
 2. mirrors the wrapped command's output to your terminal,
 3. detects the first localhost callback URL with a port,
-4. starts an SSH reverse tunnel for that port until the wrapped command exits.
+4. asks you to confirm the detected tunnel details and lets you edit `port`, `user`, and `origin` if needed,
+5. starts an SSH reverse tunnel for that port until the wrapped command exits.
 
 ## Usage
 
@@ -36,6 +37,7 @@ hitch --origin 203.0.113.10 --port 38983
 
 - Hitch only reacts to loopback redirect URLs: `localhost`, `127.0.0.1`, and `::1`.
 - It only starts one tunnel per invocation. The first valid loopback URL wins.
+- In wrapped-command mode, Hitch asks you to confirm the detected tunnel details before opening the tunnel.
 - `--port <port>` opens a reverse tunnel immediately and keeps it alive until interrupted.
 - If a redirect URL is not loopback, Hitch reports that the original login command configuration should be checked.
 - If no origin can be determined, Hitch continues running the wrapped command and reports why tunneling could not be established.

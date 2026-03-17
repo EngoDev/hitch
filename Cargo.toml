@@ -10,6 +10,7 @@ description = "CLI tool for easily logging into accounts using aouth2 from a rem
 [dependencies]
 clap = { version = "4.5.39", features = ["derive"] }
 ctrlc = "3.5.0"
+inquire = "0.7.5"
 libc = "0.2.183"
 portable-pty = "0.9.0"
 regex = "1.12.2"

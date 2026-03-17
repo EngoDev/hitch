@@ -1,7 +1,3 @@
-pub fn found_loopback_url(url: &str, host: &str, port: u16) -> String {
-    format!("Found localhost redirect URL: {url} (host: {host}, port: {port})")
-}
-
 pub fn starting_tunnel(destination: &str, port: u16) -> String {
     format!("Starting reverse tunnel for port {port} to {destination}")
 }
@@ -29,6 +25,10 @@ pub fn missing_origin() -> String {
 
 pub fn tunnel_launch_failed(error: &std::io::Error) -> String {
     format!("Could not establish tunnel: {error}")
+}
+
+pub fn tunnel_confirmation_failed(error: &std::io::Error) -> String {
+    format!("Could not confirm tunnel details: {error}")
 }
 
 #[cfg(test)]

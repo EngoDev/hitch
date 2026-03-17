@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod confirm;
 pub mod detect;
 pub mod origin;
 pub mod runtime;
@@ -114,5 +115,6 @@ mod tests {
 
         assert!(readme.contains("hitch [--origin <host>] [--user <ssh-user>] --port <port>"));
         assert!(readme.contains("hitch --origin 203.0.113.10 --port 38983"));
+        assert!(readme.contains("asks you to confirm the detected tunnel details"));
     }
 }
