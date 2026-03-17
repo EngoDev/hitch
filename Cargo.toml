@@ -1,11 +1,12 @@
 [package]
 name = "hitch"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["EngoDev"]
 license = "MIT"
 readme = "README.md"
-description = "CLI tool for easily logging into accounts using aouth2 from a remote machine."
+categories = ["cli", "ssh", "quality-of-life"]
+description = "CLI tool for easily logging into accounts that require a browser from a remote machine."
 
 [dependencies]
 clap = { version = "4.5.39", features = ["derive"] }
