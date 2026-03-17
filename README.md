@@ -2,6 +2,28 @@
 
 Hitch wraps login commands that expect an OAuth callback on `localhost` and makes that callback reachable when the command is running on a remote machine over SSH.
 
+## Installation
+
+Quick install from the hosted script:
+
+```bash
+curl -fsSL https://hitch.sh | bash
+```
+
+Install a specific release:
+
+```bash
+HITCH_VERSION=v0.1.0 curl -fsSL https://hitch.sh | bash
+```
+
+Build and install from source with Cargo:
+
+```bash
+cargo install hitch --locked
+```
+
+The hosted installer currently supports Linux `x86_64` and Linux `aarch64`.
+
 It is designed for flows like:
 
 ```bash
