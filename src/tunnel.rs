@@ -1,19 +1,27 @@
+//! SSH reverse tunnel launching and lifecycle helpers.
+
 use std::io;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs, process};
 
+/// Represents a running tunnel that can be stopped.
 pub trait TunnelHandle {
+    /// Stops the tunnel and performs any associated cleanup.
     fn stop(&mut self) -> io::Result<()>;
 }
 
+/// Launches reverse SSH tunnels and returns a handle for lifecycle management.
 pub trait TunnelLauncher {
+    /// The handle type returned for a launched tunnel.
     type Handle: TunnelHandle;
 
+    /// Launches a tunnel to `destination` for the provided local `port`.
     fn launch(&mut self, destination: &str, port: u16) -> io::Result<Self::Handle>;
 }
 
+/// Tunnel handle backed by an SSH control socket and temporary control directory.
 #[derive(Debug)]
 pub struct ProcessTunnelHandle {
     control_dir: PathBuf,
@@ -22,6 +30,7 @@ pub struct ProcessTunnelHandle {
 }
 
 impl ProcessTunnelHandle {
+    /// Creates a new process-backed tunnel handle.
     pub fn new(control_dir: PathBuf, control_path: PathBuf, destination: String) -> Self {
         Self {
             control_dir,
@@ -50,6 +59,7 @@ impl TunnelHandle for ProcessTunnelHandle {
     }
 }
 
+/// Production tunnel launcher that shells out to `ssh`.
 #[derive(Debug, Default)]
 pub struct SshTunnelLauncher;
 
@@ -90,6 +100,7 @@ impl TunnelLauncher for SshTunnelLauncher {
     }
 }
 
+/// Formats an SSH destination string from an origin host and optional user.
 pub fn format_destination(origin: &str, user: Option<&str>) -> String {
     match user {
         Some(user) => format!("{user}@{origin}"),
@@ -97,6 +108,7 @@ pub fn format_destination(origin: &str, user: Option<&str>) -> String {
     }
 }
 
+/// Builds the `ssh` arguments needed for a reverse tunnel on `port`.
 pub fn build_reverse_tunnel_args(port: u16, destination: &str) -> Vec<String> {
     vec![
         "-N".to_string(),
@@ -106,6 +118,7 @@ pub fn build_reverse_tunnel_args(port: u16, destination: &str) -> Vec<String> {
     ]
 }
 
+/// Creates a unique temporary directory for the SSH control socket.
 fn create_control_dir() -> io::Result<PathBuf> {
     static NEXT_TUNNEL_ID: AtomicU64 = AtomicU64::new(0);
 

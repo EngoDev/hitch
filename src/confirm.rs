@@ -1,21 +1,33 @@
+//! Tunnel confirmation and edit flow for auto-detected callback tunnels.
+
 use std::io;
 
 use inquire::{Confirm, Text, validator::Validation};
 
+/// Tunnel launch settings that may be auto-detected and optionally edited by the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelConfig {
+    /// Local callback port to expose through the reverse tunnel.
     pub port: u16,
+    /// Optional SSH user override for the reverse tunnel destination.
     pub user: Option<String>,
+    /// SSH origin host or IP address to connect back to.
     pub origin: String,
 }
 
+/// Interactive editor used to confirm or correct auto-detected tunnel settings.
 pub trait TunnelConfigEditor: Send {
+    /// Asks whether the detected configuration looks correct as-is.
     fn confirm_detected_config(&mut self, config: &TunnelConfig) -> io::Result<bool>;
+    /// Prompts for a replacement callback port.
     fn edit_port(&mut self, current: u16) -> io::Result<String>;
+    /// Prompts for a replacement SSH user.
     fn edit_user(&mut self, current: Option<&str>) -> io::Result<String>;
+    /// Prompts for a replacement origin host or IP.
     fn edit_origin(&mut self, current: &str) -> io::Result<String>;
 }
 
+/// Runs the confirmation flow and returns the final tunnel configuration to use.
 pub fn confirm_tunnel_config<E: TunnelConfigEditor + ?Sized>(
     editor: &mut E,
     detected: TunnelConfig,
@@ -31,11 +43,12 @@ pub fn confirm_tunnel_config<E: TunnelConfigEditor + ?Sized>(
     Ok(TunnelConfig { port, user, origin })
 }
 
+/// Production confirmation editor implemented with `inquire`.
 pub struct InquireTunnelConfigEditor;
 
 impl TunnelConfigEditor for InquireTunnelConfigEditor {
     fn confirm_detected_config(&mut self, config: &TunnelConfig) -> io::Result<bool> {
-        println!(
+        eprintln!(
             "[hitch] Detected tunnel details:\n[hitch]   port: {}\n[hitch]   user: {}\n[hitch]   origin: {}",
             config.port,
             config.user.as_deref().unwrap_or("<default>"),
@@ -85,17 +98,28 @@ impl TunnelConfigEditor for InquireTunnelConfigEditor {
     }
 }
 
+/// Converts an `inquire` error into an I/O error suitable for runtime propagation.
 fn inquire_to_io_error(error: inquire::InquireError) -> io::Error {
     io::Error::other(error.to_string())
 }
 
+/// Parses and validates a tunnel port, rejecting invalid values and port `0`.
 fn parse_port(value: &str) -> io::Result<u16> {
-    value
-        .trim()
-        .parse::<u16>()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Port must be a valid TCP port"))
+    let port = value.trim().parse::<u16>().map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Port must be a valid TCP port")
+    })?;
+
+    if port == 0 {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Port must be between 1 and 65535",
+        ))
+    } else {
+        Ok(port)
+    }
 }
 
+/// Normalizes an edited SSH user string, treating empty input as “no explicit user”.
 fn parse_user(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -105,6 +129,7 @@ fn parse_user(value: &str) -> Option<String> {
     }
 }
 
+/// Parses and validates an edited origin host or IP.
 fn parse_origin(value: &str) -> io::Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -230,6 +255,26 @@ mod tests {
         let mut editor = ScriptedEditor {
             confirm: false,
             port_response: Some("not-a-port".into()),
+            user_response: Some("engodev".into()),
+            origin_response: Some("100.70.126.5".into()),
+            ..Default::default()
+        };
+
+        let error = confirm_tunnel_config(&mut editor, detected).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_zero_port_input() {
+        let detected = TunnelConfig {
+            port: 3001,
+            user: Some("engodev".into()),
+            origin: "100.70.126.5".into(),
+        };
+        let mut editor = ScriptedEditor {
+            confirm: false,
+            port_response: Some("0".into()),
             user_response: Some("engodev".into()),
             origin_response: Some("100.70.126.5".into()),
             ..Default::default()

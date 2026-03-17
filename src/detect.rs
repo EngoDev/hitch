@@ -1,25 +1,26 @@
+//! Streaming URL detection for OAuth callback discovery.
+
 use std::sync::OnceLock;
 
 use regex::Regex;
 use url::Url;
 
+/// An action emitted by the detector after classifying observed output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetectionEvent {
+    /// A loopback callback URL with an explicit port was found.
     StartTunnel {
         host: String,
         port: u16,
         url: String,
     },
-    WarnNonLoopback {
-        host: String,
-        url: String,
-    },
-    WarnMissingPort {
-        host: String,
-        url: String,
-    },
+    /// A redirect URL was found, but it does not point to a loopback host.
+    WarnNonLoopback { host: String, url: String },
+    /// A loopback redirect URL was found, but it omitted the callback port.
+    WarnMissingPort { host: String, url: String },
 }
 
+/// Stateful detector that scans output for callback URLs and emits at most one tunnel start.
 #[derive(Debug, Default)]
 pub struct UrlDetector {
     tunnel_started: bool,
@@ -28,6 +29,7 @@ pub struct UrlDetector {
 }
 
 impl UrlDetector {
+    /// Consumes streamed text and returns the next detection event, if any.
     pub fn consume(&mut self, text: &str) -> Option<DetectionEvent> {
         if self.tunnel_started {
             return None;
@@ -81,6 +83,7 @@ impl UrlDetector {
     }
 }
 
+/// Expands a top-level candidate URL into nested URL values found in query parameters.
 fn candidate_urls(text: &str) -> Vec<Url> {
     let Ok(url) = Url::parse(text) else {
         return Vec::new();
@@ -91,6 +94,7 @@ fn candidate_urls(text: &str) -> Vec<Url> {
     urls
 }
 
+/// Recursively collects a URL and any URL-valued query parameters it contains.
 fn collect_candidate_urls(url: &Url, urls: &mut Vec<Url>) {
     urls.push(url.clone());
 
@@ -106,11 +110,13 @@ fn collect_candidate_urls(url: &Url, urls: &mut Vec<Url>) {
     }
 }
 
+/// Returns the compiled URL-matching regex used for initial candidate extraction.
 fn url_regex() -> &'static Regex {
     static URL_REGEX: OnceLock<Regex> = OnceLock::new();
     URL_REGEX.get_or_init(|| Regex::new(r#"https?://[^\s<>\")']+"#).unwrap())
 }
 
+/// Formats the URL host exactly as it should appear in status messages and comparisons.
 fn display_host(url: &Url) -> Option<String> {
     url.host_str().map(|host| {
         if host.starts_with('[') && host.ends_with(']') {
@@ -123,6 +129,7 @@ fn display_host(url: &Url) -> Option<String> {
     })
 }
 
+/// Returns whether a host string refers to a supported loopback address.
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "[::1]")
 }

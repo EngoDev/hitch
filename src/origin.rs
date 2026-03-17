@@ -1,6 +1,9 @@
+//! SSH origin resolution helpers.
+
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+/// Error returned when Hitch cannot determine the SSH origin host.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ResolveOriginError;
 
@@ -15,6 +18,7 @@ impl Display for ResolveOriginError {
 
 impl Error for ResolveOriginError {}
 
+/// Resolves the SSH origin host from an explicit flag or the `SSH_CONNECTION` environment value.
 pub fn resolve_origin(
     cli_origin: Option<&str>,
     ssh_connection: Option<&str>,

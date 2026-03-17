@@ -1,24 +1,35 @@
+//! Hitch library crate.
+
+/// Command-line parsing.
 pub mod cli;
+/// Runtime configuration types.
 pub mod config;
+/// Tunnel confirmation and editing flow.
 pub mod confirm;
+/// URL detection for callback discovery.
 pub mod detect;
+/// Origin resolution from CLI flags and SSH environment.
 pub mod origin;
+/// Runtime orchestration and PTY handling.
 pub mod runtime;
+/// User-facing status message formatting.
 pub mod status;
+/// SSH tunnel launching and lifecycle management.
 pub mod tunnel;
 
 #[cfg(test)]
 mod tests {
     use crate::cli::Cli;
-    use crate::config::Mode;
+    use crate::config::{Config, Mode};
 
     #[test]
     fn parses_origin_user_and_wrapped_command() {
-        let config = Cli::try_parse_from([
+        let config: Config = Cli::try_parse_from([
             "hitch", "--user", "alice", "--origin", "10.0.0.5", "--", "aws", "login",
         ])
         .unwrap()
-        .into_config();
+        .try_into()
+        .unwrap();
 
         assert_eq!(config.user.as_deref(), Some("alice"));
         assert_eq!(config.origin.as_deref(), Some("10.0.0.5"));
@@ -32,9 +43,10 @@ mod tests {
 
     #[test]
     fn parses_wrapped_command_without_overrides() {
-        let config = Cli::try_parse_from(["hitch", "--", "aws", "login"])
+        let config: Config = Cli::try_parse_from(["hitch", "--", "aws", "login"])
             .unwrap()
-            .into_config();
+            .try_into()
+            .unwrap();
 
         assert_eq!(config.user, None);
         assert_eq!(config.origin, None);
@@ -48,9 +60,10 @@ mod tests {
 
     #[test]
     fn parses_port_mode_without_command() {
-        let config = Cli::try_parse_from(["hitch", "--port", "38983"])
+        let config: Config = Cli::try_parse_from(["hitch", "--port", "38983"])
             .unwrap()
-            .into_config();
+            .try_into()
+            .unwrap();
 
         assert_eq!(config.origin, None);
         assert_eq!(config.user, None);
@@ -59,11 +72,12 @@ mod tests {
 
     #[test]
     fn parses_port_mode_with_origin_and_user() {
-        let config = Cli::try_parse_from([
+        let config: Config = Cli::try_parse_from([
             "hitch", "--port", "38983", "--origin", "10.0.0.5", "--user", "alice",
         ])
         .unwrap()
-        .into_config();
+        .try_into()
+        .unwrap();
 
         assert_eq!(config.origin.as_deref(), Some("10.0.0.5"));
         assert_eq!(config.user.as_deref(), Some("alice"));
@@ -93,6 +107,13 @@ mod tests {
             Cli::try_parse_from(["hitch", "--port", "38983", "--", "aws", "login"]).unwrap_err();
 
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn rejects_port_zero() {
+        let error = Cli::try_parse_from(["hitch", "--port", "0"]).unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]

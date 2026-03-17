@@ -1,3 +1,5 @@
+//! Runtime orchestration for wrapped-command execution, direct tunnels, and terminal handling.
+
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -16,12 +18,14 @@ use crate::origin::resolve_origin;
 use crate::status;
 use crate::tunnel::{SshTunnelLauncher, TunnelHandle, TunnelLauncher, format_destination};
 
+/// Scripted wrapped-command session used by runtime tests.
 #[cfg(test)]
 pub struct ScriptedSession {
     pub output_chunks: Vec<String>,
     pub exit_code: i32,
 }
 
+/// Result captured from a scripted wrapped-command test run.
 #[cfg(test)]
 pub struct RunOutcome {
     pub exit_code: i32,
@@ -29,52 +33,62 @@ pub struct RunOutcome {
     pub messages: Vec<String>,
 }
 
+/// Result captured from a scripted direct-tunnel test run.
 #[cfg(test)]
 pub struct PortModeOutcome {
     pub exit_code: i32,
     pub messages: Vec<String>,
 }
 
+/// Shared pause gate used to temporarily stop stdin forwarding.
 #[derive(Clone, Debug, Default)]
 pub struct InputGate {
     paused: Arc<AtomicBool>,
 }
 
 impl InputGate {
+    /// Pauses any input-forwarding loop that consults this gate.
     pub fn pause(&self) {
         self.paused.store(true, Ordering::SeqCst);
     }
 
+    /// Resumes any input-forwarding loop that consults this gate.
     pub fn resume(&self) {
         self.paused.store(false, Ordering::SeqCst);
     }
 
+    /// Returns whether forwarding is currently paused.
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::SeqCst)
     }
 }
 
+/// Tunnel launcher wrapper that pauses stdin forwarding while SSH authenticates.
 pub struct PausingTunnelLauncher<L> {
     inner: L,
     input_gate: InputGate,
 }
 
 impl<L> PausingTunnelLauncher<L> {
+    /// Creates a pausing tunnel launcher from an inner launcher and input gate.
     pub fn new(inner: L, input_gate: InputGate) -> Self {
         Self { inner, input_gate }
     }
 }
 
+/// Confirmation editor wrapper that pauses stdin forwarding while prompting.
 struct PausingTunnelConfigEditor<E> {
     inner: E,
     input_gate: InputGate,
 }
 
 impl<E> PausingTunnelConfigEditor<E> {
+    /// Creates a pausing confirmation editor from an inner editor and input gate.
     fn new(inner: E, input_gate: InputGate) -> Self {
         Self { inner, input_gate }
     }
 
+    /// Runs a prompt operation while stdin forwarding is paused.
     fn with_paused_input<F, T>(&mut self, operation: F) -> io::Result<T>
     where
         F: FnOnce(&mut E) -> io::Result<T>,
@@ -115,12 +129,14 @@ impl<L: TunnelLauncher> TunnelLauncher for PausingTunnelLauncher<L> {
     }
 }
 
+/// Abstraction for temporarily changing the parent terminal mode.
 trait TerminalModeManager {
     type Guard;
 
     fn enter_raw_mode(&self) -> io::Result<Self::Guard>;
 }
 
+/// Runs an operation while a terminal mode guard is active.
 fn with_terminal_mode<M, F, T>(manager: &M, operation: F) -> io::Result<T>
 where
     M: TerminalModeManager,
@@ -130,6 +146,7 @@ where
     operation()
 }
 
+/// No-op terminal mode manager used on non-Unix platforms.
 #[cfg(not(unix))]
 struct NoopTerminalModeManager;
 
@@ -142,9 +159,11 @@ impl TerminalModeManager for NoopTerminalModeManager {
     }
 }
 
+/// Unix terminal mode manager that places stdin into raw mode.
 #[cfg(unix)]
 struct StdinRawModeManager;
 
+/// Guard that restores the original Unix terminal mode on drop.
 #[cfg(unix)]
 struct StdinRawModeGuard {
     fd: libc::c_int,
@@ -196,6 +215,7 @@ impl TerminalModeManager for StdinRawModeManager {
     }
 }
 
+/// Builds a raw terminal mode while preserving output flags for normal line rendering.
 #[cfg(unix)]
 fn build_raw_terminal_mode(original: &libc::termios) -> libc::termios {
     let mut raw = *original;
@@ -207,8 +227,10 @@ fn build_raw_terminal_mode(original: &libc::termios) -> libc::termios {
 #[cfg(not(unix))]
 type StdinRawModeManager = NoopTerminalModeManager;
 
+/// Active wrapped-command runtime state.
 pub struct Runtime<L: TunnelLauncher> {
     detector: UrlDetector,
+    detection_buffer: String,
     launcher: L,
     editor: Box<dyn TunnelConfigEditor>,
     origin: Option<String>,
@@ -219,6 +241,7 @@ pub struct Runtime<L: TunnelLauncher> {
 }
 
 impl<L: TunnelLauncher> Runtime<L> {
+    /// Creates a new runtime with the given tunnel launcher, confirmation editor, and defaults.
     pub fn new(
         launcher: L,
         editor: Box<dyn TunnelConfigEditor>,
@@ -227,6 +250,7 @@ impl<L: TunnelLauncher> Runtime<L> {
     ) -> Self {
         Self {
             detector: UrlDetector::default(),
+            detection_buffer: String::new(),
             launcher,
             editor,
             origin,
@@ -237,8 +261,11 @@ impl<L: TunnelLauncher> Runtime<L> {
         }
     }
 
+    /// Consumes newly mirrored child output and reacts to tunnel-relevant events.
     pub fn on_output(&mut self, text: &str) {
-        match self.detector.consume(text) {
+        self.detection_buffer.push_str(text);
+
+        match self.detector.consume(&self.detection_buffer) {
             Some(DetectionEvent::StartTunnel { port, .. }) => self.try_start_tunnel(port),
             Some(DetectionEvent::WarnNonLoopback { host, url }) => {
                 self.messages
@@ -250,8 +277,11 @@ impl<L: TunnelLauncher> Runtime<L> {
             }
             None => {}
         }
+
+        trim_detection_buffer(&mut self.detection_buffer);
     }
 
+    /// Stops any active tunnel and clears runtime tunnel state.
     pub fn finish(&mut self) -> std::io::Result<()> {
         if let Some(handle) = self.tunnel_handle.as_mut() {
             handle.stop()?;
@@ -261,14 +291,17 @@ impl<L: TunnelLauncher> Runtime<L> {
         Ok(())
     }
 
+    /// Returns queued status messages without consuming them.
     pub fn messages(&self) -> &[String] {
         &self.messages
     }
 
+    /// Drains and returns queued status messages.
     pub fn drain_messages(&mut self) -> Vec<String> {
         std::mem::take(&mut self.messages)
     }
 
+    /// Confirms and launches a reverse tunnel for an auto-detected callback port.
     fn try_start_tunnel(&mut self, port: u16) {
         let Some(origin) = self.origin.as_deref() else {
             if !self.reported_missing_origin {
@@ -303,6 +336,7 @@ impl<L: TunnelLauncher> Runtime<L> {
         }
     }
 
+    /// Executes a scripted wrapped-command session for tests.
     #[cfg(test)]
     pub fn run_scripted_for_test(
         launcher: L,
@@ -328,6 +362,7 @@ impl<L: TunnelLauncher> Runtime<L> {
         }
     }
 
+    /// Executes scripted direct-tunnel mode for tests.
     #[cfg(test)]
     pub fn run_port_mode_for_test(
         launcher: L,
@@ -356,6 +391,7 @@ impl<L: TunnelLauncher> Runtime<L> {
     }
 }
 
+/// Runs Hitch from a validated runtime configuration.
 pub fn run_wrapped_command(config: Config) -> Result<i32, Box<dyn std::error::Error>> {
     match config.mode {
         Mode::Command { command } => run_command_mode(config.origin, config.user, command),
@@ -363,6 +399,7 @@ pub fn run_wrapped_command(config: Config) -> Result<i32, Box<dyn std::error::Er
     }
 }
 
+/// Runs wrapped-command mode inside a PTY and mirrors the child process I/O.
 fn run_command_mode(
     origin_override: Option<String>,
     user: Option<String>,
@@ -435,6 +472,7 @@ fn run_command_mode(
     .map_err(Into::into)
 }
 
+/// Runs direct `--port` mode and keeps the tunnel open until interrupted.
 fn run_port_mode(
     origin_override: Option<String>,
     user: Option<String>,
@@ -455,6 +493,7 @@ fn run_port_mode(
     )
 }
 
+/// Shared direct-tunnel implementation parameterized over the interrupt waiter for tests.
 fn run_port_mode_with_wait<L, F>(
     mut launcher: L,
     origin: Option<String>,
@@ -488,6 +527,7 @@ where
     Ok(0)
 }
 
+/// Blocks until the user interrupts the process with Ctrl+C.
 fn wait_for_ctrl_c() -> io::Result<()> {
     let (sender, receiver) = mpsc::channel();
     ctrlc::set_handler(move || {
@@ -501,6 +541,7 @@ fn wait_for_ctrl_c() -> io::Result<()> {
     Ok(())
 }
 
+/// Mirrors PTY output to stdout while feeding buffered data into the detector.
 fn mirror_output<L: TunnelLauncher + Send + 'static>(
     mut reader: Box<dyn Read + Send>,
     runtime: Arc<Mutex<Runtime<L>>>,
@@ -532,6 +573,23 @@ fn mirror_output<L: TunnelLauncher + Send + 'static>(
     }
 }
 
+/// Trims the detection carry-over buffer to a bounded size.
+fn trim_detection_buffer(buffer: &mut String) {
+    const MAX_DETECTION_BUFFER_LEN: usize = 2048;
+
+    if buffer.len() <= MAX_DETECTION_BUFFER_LEN {
+        return;
+    }
+
+    let split_at = buffer.len() - MAX_DETECTION_BUFFER_LEN;
+    let split_at = match buffer.char_indices().find(|(index, _)| *index >= split_at) {
+        Some((index, _)) => index,
+        None => 0,
+    };
+    buffer.drain(..split_at);
+}
+
+/// Forwards stdin to the wrapped PTY on Unix while honoring the input pause gate.
 #[cfg(unix)]
 fn forward_input(mut writer: Box<dyn Write + Send>, input_gate: InputGate) -> io::Result<()> {
     use std::os::fd::AsRawFd;
@@ -577,6 +635,7 @@ fn forward_input(mut writer: Box<dyn Write + Send>, input_gate: InputGate) -> io
     }
 }
 
+/// Forwards stdin to the wrapped PTY on non-Unix platforms.
 #[cfg(not(unix))]
 fn forward_input(mut writer: Box<dyn Write + Send>, input_gate: InputGate) -> io::Result<()> {
     let mut stdin = io::stdin();
@@ -600,16 +659,22 @@ fn forward_input(mut writer: Box<dyn Write + Send>, input_gate: InputGate) -> io
     }
 }
 
+/// Writes Hitch status messages to stderr.
 fn print_status_messages(messages: Vec<String>) -> io::Result<()> {
+    let mut stderr = io::stderr();
+    print_status_messages_to(&mut stderr, messages)
+}
+
+/// Writes Hitch status messages to an arbitrary writer.
+fn print_status_messages_to<W: Write>(writer: &mut W, messages: Vec<String>) -> io::Result<()> {
     if messages.is_empty() {
         return Ok(());
     }
 
-    let mut stdout = io::stdout();
     for message in messages {
-        writeln!(stdout, "[hitch] {message}")?;
+        writeln!(writer, "[hitch] {message}")?;
     }
-    stdout.flush()
+    writer.flush()
 }
 
 #[cfg(test)]
@@ -623,7 +688,7 @@ mod tests {
     use super::build_raw_terminal_mode;
     use super::{
         InputGate, PausingTunnelConfigEditor, PausingTunnelLauncher, Runtime, ScriptedSession,
-        TerminalModeManager, with_terminal_mode,
+        TerminalModeManager, print_status_messages_to, with_terminal_mode,
     };
     use crate::confirm::{TunnelConfig, TunnelConfigEditor};
     use crate::tunnel::{TunnelHandle, TunnelLauncher};
@@ -966,6 +1031,27 @@ mod tests {
     }
 
     #[test]
+    fn detects_callback_url_split_across_output_chunks() {
+        let launcher = FakeTunnelLauncher::new();
+        let outcome = Runtime::run_scripted_for_test(
+            launcher.clone(),
+            Box::new(AcceptingEditor),
+            Some("203.0.113.10".to_string()),
+            None,
+            ScriptedSession {
+                output_chunks: vec![
+                    "Waiting for callback on http://local".to_string(),
+                    "host:7777/auth/callback".to_string(),
+                ],
+                exit_code: 0,
+            },
+        );
+
+        assert_eq!(launcher.started_ports(), vec![7777]);
+        assert_eq!(outcome.exit_code, 0);
+    }
+
+    #[test]
     fn pausing_tunnel_launcher_pauses_input_during_launch_and_resumes_after() {
         let gate = InputGate::default();
         let saw_paused_gate = Rc::new(RefCell::new(false));
@@ -1091,6 +1177,15 @@ mod tests {
         );
 
         assert_eq!(launcher.stop_count(), 1);
+    }
+
+    #[test]
+    fn status_messages_are_written_to_stderr_output() {
+        let mut stderr = Vec::new();
+
+        print_status_messages_to(&mut stderr, vec!["hello".to_string()]).unwrap();
+
+        assert_eq!(String::from_utf8(stderr).unwrap(), "[hitch] hello\n");
     }
 
     #[test]

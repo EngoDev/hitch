@@ -1,19 +1,25 @@
+//! Command-line parsing for Hitch.
+
 use std::env;
 use std::ffi::OsString;
 
 use clap::{Arg, Command, error::ErrorKind};
 
-use crate::config::{Config, Mode};
-
+/// Parsed command-line arguments before conversion into runtime configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cli {
+    /// Optional SSH origin override.
     pub origin: Option<String>,
+    /// Optional SSH user override.
     pub user: Option<String>,
+    /// Optional direct-tunnel port.
     pub port: Option<u16>,
+    /// Optional wrapped command and arguments.
     pub command: Option<Vec<String>>,
 }
 
 impl Cli {
+    /// Builds the top-level Clap command definition for Hitch.
     pub fn command() -> Command {
         Command::new("hitch")
             .about("Wrap a login command and establish callback tunneling when needed.")
@@ -33,7 +39,7 @@ impl Cli {
                 Arg::new("port")
                     .long("port")
                     .value_name("PORT")
-                    .value_parser(clap::value_parser!(u16))
+                    .value_parser(parse_port_arg)
                     .help("Open a reverse tunnel directly for the specified local port."),
             )
             .after_help(
@@ -41,10 +47,12 @@ impl Cli {
             )
     }
 
+    /// Parses the current process arguments into a [`Cli`] value.
     pub fn parse() -> Self {
         Self::try_parse_from(env::args_os()).unwrap_or_else(|error| error.exit())
     }
 
+    /// Parses an arbitrary iterator of arguments into a [`Cli`] value.
     pub fn try_parse_from<I, T>(args: I) -> Result<Self, clap::Error>
     where
         I: IntoIterator<Item = T>,
@@ -109,16 +117,17 @@ impl Cli {
             ),
         })
     }
+}
 
-    pub fn into_config(self) -> Config {
-        Config {
-            origin: self.origin,
-            user: self.user,
-            mode: match (self.port, self.command) {
-                (Some(port), None) => Mode::Port { port },
-                (None, Some(command)) => Mode::Command { command },
-                _ => unreachable!("CLI validation guarantees exactly one invocation mode"),
-            },
-        }
+/// Parses a direct tunnel port from the CLI and rejects reserved port `0`.
+fn parse_port_arg(value: &str) -> Result<u16, String> {
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| "PORT must be a valid TCP port".to_string())?;
+
+    if port == 0 {
+        Err("PORT must be between 1 and 65535".to_string())
+    } else {
+        Ok(port)
     }
 }
