@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["EngoDev"]
 license = "MIT"
 readme = "README.md"
-categories = ["cli", "ssh", "quality-of-life"]
+categories = ["command-line-utilities"]
 description = "CLI tool for easily logging into accounts that require a browser from a remote machine."
 
 [dependencies]
