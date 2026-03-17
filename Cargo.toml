@@ -1,0 +1,10 @@
+[package]
+name = "hatchway"
+version = "0.1.0"
+edition = "2024"
+authors = ["EngoDev"]
+license = "MIT"
+readme = "README.md"
+description = "CLI tool for easily logging into accounts using aouth2 from a remote machine."
+
+[dependencies]
